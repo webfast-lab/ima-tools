@@ -97,6 +97,23 @@ pub enum ImaReplayError {
         expected: usize,
         actual: usize,
     },
+    #[error("line {line}: template {template} cannot be rebuilt from ASCII fields")]
+    UnsupportedAsciiTemplate { line: usize, template: String },
+    #[error("line {line}: template {template} is missing field {field}")]
+    MissingTemplateField {
+        line: usize,
+        template: String,
+        field: &'static str,
+    },
+    #[error("line {line}: invalid template field {field}: {source}")]
+    InvalidTemplateFieldHex {
+        line: usize,
+        field: &'static str,
+        #[source]
+        source: hex::FromHexError,
+    },
+    #[error("line {line}: invalid digest field {field}")]
+    InvalidDigestField { line: usize, field: &'static str },
     #[error("binary input truncated while reading {field} at offset {offset}")]
     BinaryTruncated { field: &'static str, offset: usize },
     #[error("binary input has trailing {bytes} byte(s) after the last complete record")]
@@ -167,11 +184,15 @@ fn parse_ascii_measurements(
                 line: line_number,
                 value: columns[0].to_owned(),
             })?;
-        let template_digest =
+        let mut template_digest =
             hex::decode(columns[1]).map_err(|source| ImaReplayError::InvalidDigestHex {
                 line: line_number,
                 source,
             })?;
+
+        if template_digest.len() != algorithm.digest_len() {
+            template_digest = rebuild_ascii_template_digest(line_number, &columns, algorithm)?;
+        }
 
         validate_digest_len(records.len() + 1, algorithm, template_digest.len())?;
         records.push(MeasurementRecord {
@@ -185,6 +206,154 @@ fn parse_ascii_measurements(
     }
 
     Ok(records)
+}
+
+fn rebuild_ascii_template_digest(
+    line: usize,
+    columns: &[&str],
+    algorithm: HashAlgorithm,
+) -> Result<Vec<u8>, ImaReplayError> {
+    let template = columns[2];
+    let fields = match template {
+        "ima-ng" => vec![
+            rebuild_digest_with_algo_field(line, columns, 3, "d-ng")?,
+            rebuild_string_field(line, columns, 4, template, "n-ng")?,
+        ],
+        "ima-sig" => vec![
+            rebuild_digest_with_algo_field(line, columns, 3, "d-ng")?,
+            rebuild_string_field(line, columns, 4, template, "n-ng")?,
+            rebuild_optional_hex_field(line, columns, 5, "sig")?,
+        ],
+        "ima-buf" => vec![
+            rebuild_digest_with_algo_field(line, columns, 3, "d-ng")?,
+            rebuild_string_field(line, columns, 4, template, "n-ng")?,
+            rebuild_optional_hex_field(line, columns, 5, "buf")?,
+        ],
+        "ima-ngv2" => vec![
+            rebuild_digest_with_type_and_algo_field(line, columns, 3, "d-ngv2")?,
+            rebuild_string_field(line, columns, 4, template, "n-ng")?,
+        ],
+        "ima-sigv2" => vec![
+            rebuild_digest_with_type_and_algo_field(line, columns, 3, "d-ngv2")?,
+            rebuild_string_field(line, columns, 4, template, "n-ng")?,
+            rebuild_optional_hex_field(line, columns, 5, "sig")?,
+        ],
+        _ => {
+            return Err(ImaReplayError::UnsupportedAsciiTemplate {
+                line,
+                template: template.to_owned(),
+            });
+        }
+    };
+
+    let mut template_data = Vec::new();
+    for field in fields {
+        template_data.extend_from_slice(&(field.len() as u32).to_le_bytes());
+        template_data.extend_from_slice(&field);
+    }
+
+    Ok(algorithm.digest(&template_data))
+}
+
+fn rebuild_digest_with_algo_field(
+    line: usize,
+    columns: &[&str],
+    index: usize,
+    field: &'static str,
+) -> Result<Vec<u8>, ImaReplayError> {
+    let value = columns
+        .get(index)
+        .ok_or_else(|| ImaReplayError::MissingTemplateField {
+            line,
+            template: columns[2].to_owned(),
+            field,
+        })?;
+    let (algo, digest_hex) = value
+        .split_once(':')
+        .ok_or(ImaReplayError::InvalidDigestField { line, field })?;
+    let digest =
+        hex::decode(digest_hex).map_err(|source| ImaReplayError::InvalidTemplateFieldHex {
+            line,
+            field,
+            source,
+        })?;
+
+    let mut data = Vec::with_capacity(algo.len() + 2 + digest.len());
+    data.extend_from_slice(algo.as_bytes());
+    data.extend_from_slice(b":\0");
+    data.extend_from_slice(&digest);
+    Ok(data)
+}
+
+fn rebuild_digest_with_type_and_algo_field(
+    line: usize,
+    columns: &[&str],
+    index: usize,
+    field: &'static str,
+) -> Result<Vec<u8>, ImaReplayError> {
+    let value = columns
+        .get(index)
+        .ok_or_else(|| ImaReplayError::MissingTemplateField {
+            line,
+            template: columns[2].to_owned(),
+            field,
+        })?;
+    let (digest_type, rest) = value
+        .split_once(':')
+        .ok_or(ImaReplayError::InvalidDigestField { line, field })?;
+    let (algo, digest_hex) = rest
+        .split_once(':')
+        .ok_or(ImaReplayError::InvalidDigestField { line, field })?;
+    let digest =
+        hex::decode(digest_hex).map_err(|source| ImaReplayError::InvalidTemplateFieldHex {
+            line,
+            field,
+            source,
+        })?;
+
+    let mut data = Vec::with_capacity(digest_type.len() + algo.len() + 3 + digest.len());
+    data.extend_from_slice(digest_type.as_bytes());
+    data.push(b':');
+    data.extend_from_slice(algo.as_bytes());
+    data.extend_from_slice(b":\0");
+    data.extend_from_slice(&digest);
+    Ok(data)
+}
+
+fn rebuild_string_field(
+    line: usize,
+    columns: &[&str],
+    index: usize,
+    template: &str,
+    field: &'static str,
+) -> Result<Vec<u8>, ImaReplayError> {
+    let value = columns
+        .get(index)
+        .ok_or_else(|| ImaReplayError::MissingTemplateField {
+            line,
+            template: template.to_owned(),
+            field,
+        })?;
+    let mut data = Vec::with_capacity(value.len() + 1);
+    data.extend_from_slice(value.as_bytes());
+    data.push(0);
+    Ok(data)
+}
+
+fn rebuild_optional_hex_field(
+    line: usize,
+    columns: &[&str],
+    index: usize,
+    field: &'static str,
+) -> Result<Vec<u8>, ImaReplayError> {
+    let Some(value) = columns.get(index) else {
+        return Ok(Vec::new());
+    };
+    hex::decode(value).map_err(|source| ImaReplayError::InvalidTemplateFieldHex {
+        line,
+        field,
+        source,
+    })
 }
 
 fn parse_binary_measurements(
@@ -388,18 +557,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_digest_that_does_not_match_algorithm() {
-        let input = format!("10 {} ima-ng sha1:abcd /bin/a\n", hex::encode([0x11; 20]));
+    fn rebuilds_sha256_template_digest_from_ascii_ima_sig_fields() {
+        let input = "10 8aa71d146be2b1a0a53cb603be22928f1b74ae17 ima-sig sha256:94326940137a8f59b369d1aa058bccce58cbda37e68be0f138ea45c2cb743a46 boot_aggregate\n";
+
+        let actual = replay_measurements(input.as_bytes(), default_options()).unwrap();
+        let expected_template_digest =
+            hex::decode("cc1078d3b981e8ef52b3d4d9cffc2f27648d05947d4caa829e47f83fb8f8ed00")
+                .unwrap();
+        let expected = extend_sha256(&vec![0; 32], &expected_template_digest);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_mismatched_digest_when_ascii_template_is_unsupported() {
+        let input = format!(
+            "10 {} custom-template sha1:abcd /bin/a\n",
+            hex::encode([0x11; 20])
+        );
 
         let error = replay_measurements(input.as_bytes(), default_options()).unwrap_err();
 
         assert!(matches!(
             error,
-            ImaReplayError::DigestLengthMismatch {
-                expected: 32,
-                actual: 20,
-                ..
-            }
+            ImaReplayError::UnsupportedAsciiTemplate { .. }
         ));
     }
 
